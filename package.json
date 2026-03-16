@@ -2,10 +2,15 @@
   "name": "fede-kart",
   "version": "0.1.0",
   "private": true,
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "postinstall": "prisma generate",
+    "setup": "tsx --tsconfig tsconfig.json scripts/setup-local.ts",
     "db:generate": "prisma generate",
     "db:push": "prisma db push",
     "db:seed": "tsx --tsconfig tsconfig.json prisma/seed.ts",
