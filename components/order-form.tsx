@@ -3,32 +3,182 @@
 import { Customer, ServiceCatalog } from "@prisma/client";
 import { useState } from "react";
 import { invoiceStatusLabels, priorityLabels } from "@/lib/constants";
+import {
+  computeDiscountedUnitPrice,
+  discountModeLabels,
+  getTieredUnitPrice,
+  parseQuantityTiers,
+  type QuantityTier,
+  type DiscountModeValue
+} from "@/lib/pricing";
 
 type CustomerWithOrders = Customer & { orders: { id: string }[] };
 
 type ItemState = {
+  serviceQuery: string;
+  photoMode: boolean;
+  photoFormat: string;
   label: string;
-  description: string;
   quantity: number;
   unitPrice: string;
+  discountMode: DiscountModeValue;
+  discountValue: string;
   format: string;
   material: string;
   finishing: string;
   notes: string;
   serviceCatalogId: string;
+  priceOverridden: boolean;
 };
 
 const emptyItem = (): ItemState => ({
+  serviceQuery: "",
+  photoMode: false,
+  photoFormat: "",
   label: "",
-  description: "",
   quantity: 1,
   unitPrice: "",
+  discountMode: "NONE",
+  discountValue: "",
   format: "",
   material: "",
   finishing: "",
   notes: "",
-  serviceCatalogId: ""
+  serviceCatalogId: "",
+  priceOverridden: false
 });
+
+function parseDisplayPriceToCents(value: string) {
+  const normalized = value.trim().replace(/\./g, "").replace(",", ".");
+  return normalized ? Math.max(0, Math.round(Number(normalized) * 100) || 0) : 0;
+}
+
+function parseDiscountValue(mode: DiscountModeValue, value: string) {
+  const normalized = value.trim().replace(/\./g, "").replace(",", ".");
+  if (!normalized) {
+    return 0;
+  }
+
+  const parsed = Math.max(0, Number(normalized));
+  if (!Number.isFinite(parsed)) {
+    return 0;
+  }
+
+  if (mode === "AMOUNT") {
+    return Math.round(parsed * 100);
+  }
+
+  if (mode === "PERCENT") {
+    return Math.min(100, Math.round(parsed));
+  }
+
+  return 0;
+}
+
+function normalizeCatalogSearch(value: string) {
+  return value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
+}
+
+function isPhotographyService(service: ServiceCatalog) {
+  return String(service.code || "").startsWith("FOTOGRAFIE_");
+}
+
+function getServiceSearchScore(service: ServiceCatalog, normalizedQuery: string) {
+  const normalizedName = normalizeCatalogSearch(service.name);
+  const normalizedCode = normalizeCatalogSearch(service.code || "");
+  const normalizedDescription = normalizeCatalogSearch(service.description || "");
+  const haystack = [normalizedCode, normalizedName, normalizedDescription].join(" ");
+  const terms = normalizedQuery.split(/\s+/).filter(Boolean);
+
+  if (!terms.length || !terms.every((term) => haystack.includes(term))) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+
+  if (normalizedCode === normalizedQuery) {
+    return 0;
+  }
+
+  if (normalizedName === normalizedQuery) {
+    return 1;
+  }
+
+  if (normalizedCode.startsWith(normalizedQuery)) {
+    return 2;
+  }
+
+  if (normalizedName.startsWith(normalizedQuery)) {
+    return 3;
+  }
+
+  if (normalizedName.includes(normalizedQuery)) {
+    return 4;
+  }
+
+  return 5;
+}
+
+function getServiceTiers(service: ServiceCatalog | undefined): QuantityTier[] {
+  if (!service?.quantityTiers) {
+    return [];
+  }
+
+  try {
+    return parseQuantityTiers(service.quantityTiers);
+  } catch {
+    return [];
+  }
+}
+
+function isTierSelected(tier: QuantityTier, quantity: number) {
+  return quantity >= tier.minQuantity && (tier.maxQuantity === null || quantity <= tier.maxQuantity);
+}
+
+function formatTierLabel(tier: QuantityTier) {
+  return tier.maxQuantity === null
+    ? `${tier.minQuantity}+`
+    : tier.maxQuantity === tier.minQuantity
+      ? `${tier.minQuantity}`
+      : `${tier.minQuantity}-${tier.maxQuantity}`;
+}
+
+function getPhotographyFormatOptions(services: ServiceCatalog[]) {
+  return services
+    .filter(isPhotographyService)
+    .flatMap((service) => {
+      const rawFormats = service.name.replace(/^Fotografie\s*-\s*/i, "").split("/");
+      const normalizedFormats = rawFormats
+        .map((entry) => entry.trim())
+        .filter(Boolean)
+        .map((entry) => entry.replace(/\s+/g, " "));
+
+      return normalizedFormats.map((format) => ({
+        key: `${service.id}:${format}`,
+        label: format,
+        serviceId: service.id,
+        serviceName: service.name,
+        service
+      }));
+    });
+}
+
+type ServiceSuggestion =
+  | {
+      type: "service";
+      key: string;
+      label: string;
+      meta: string;
+      service: ServiceCatalog;
+    }
+  | {
+      type: "photography";
+      key: string;
+      label: string;
+      meta: string;
+    };
 
 export function OrderForm({
   customers,
@@ -41,37 +191,182 @@ export function OrderForm({
 }) {
   const [selectedCustomerId, setSelectedCustomerId] = useState("");
   const [items, setItems] = useState<ItemState[]>([emptyItem(), emptyItem()]);
+  const [activeServiceField, setActiveServiceField] = useState<number | null>(null);
+  const [openTierIndex, setOpenTierIndex] = useState<number | null>(null);
+  const selectedCustomer = customers.find((customer) => customer.id === selectedCustomerId);
+  const photographyFormats = getPhotographyFormatOptions(services);
+  const photographyServices = services.filter(isPhotographyService);
+
+  function getCatalogPriceDisplay(service: ServiceCatalog | undefined, quantity: number) {
+    if (!service) {
+      return "";
+    }
+
+    let cents = service.basePriceCents;
+
+    try {
+      cents = getTieredUnitPrice(service.basePriceCents, quantity, service.quantityTiers);
+    } catch {
+      cents = service.basePriceCents;
+    }
+
+    return (cents / 100).toFixed(2).replace(".", ",");
+  }
+
+  function getServiceSuggestions(query: string) {
+    const normalizedQuery = normalizeCatalogSearch(query);
+
+    if (!normalizedQuery) {
+      return [] as ServiceSuggestion[];
+    }
+
+    const serviceSuggestions: ServiceSuggestion[] = services
+      .filter((service) => !isPhotographyService(service))
+      .map((service) => ({
+        type: "service" as const,
+        key: service.id,
+        label: service.name,
+        meta: `${service.code || "Senza codice"} • ${(service.basePriceCents / 100).toFixed(2).replace(".", ",")} €`,
+        service,
+        score: getServiceSearchScore(service, normalizedQuery)
+      }))
+      .filter((entry) => entry.score !== Number.MAX_SAFE_INTEGER)
+      .sort(
+        (left, right) =>
+          left.score - right.score ||
+          left.service.name.localeCompare(right.service.name, "it") ||
+          (left.service.code || "").localeCompare(right.service.code || "", "it")
+      )
+      .slice(0, 6)
+      .map(({ score: _score, ...entry }) => entry);
+
+    const photographyScore = photographyServices.length
+      ? Math.min(...photographyServices.map((service) => getServiceSearchScore(service, normalizedQuery)))
+      : Number.MAX_SAFE_INTEGER;
+
+    if (photographyScore !== Number.MAX_SAFE_INTEGER) {
+      serviceSuggestions.unshift({
+        type: "photography",
+        key: "photography-group",
+        label: "Fotografie",
+        meta: "Seleziona il taglio foto nella colonna accanto"
+      });
+    }
+
+    return serviceSuggestions.slice(0, 6);
+  }
+
+  function selectServiceForRow(index: number, service: ServiceCatalog) {
+    setItems((current) =>
+      current.map((entry, itemIndex) =>
+        itemIndex === index
+          ? {
+              ...entry,
+              serviceCatalogId: service.id,
+              serviceQuery: service.name,
+              photoMode: false,
+              photoFormat: "",
+              label: service.name,
+              unitPrice: getCatalogPriceDisplay(service, entry.quantity),
+              discountMode: "NONE",
+              discountValue: "",
+              priceOverridden: false
+            }
+          : entry
+      )
+    );
+    setActiveServiceField(null);
+  }
+
+  function selectPhotographyForRow(index: number) {
+    setItems((current) =>
+      current.map((entry, itemIndex) =>
+        itemIndex === index
+          ? {
+              ...entry,
+              serviceQuery: "Fotografie",
+              photoMode: true,
+              photoFormat: "",
+              label: "Fotografie",
+              serviceCatalogId: "",
+              unitPrice: "",
+              discountMode: "NONE",
+              discountValue: "",
+              priceOverridden: false,
+              format: ""
+            }
+          : entry
+      )
+    );
+    setActiveServiceField(null);
+  }
 
   const itemsPayload = JSON.stringify(
     items
       .map((item) => {
-        const normalizedPrice = item.unitPrice.replace(/\./g, "").replace(",", ".");
-        const unitPriceCents = normalizedPrice ? Math.round(Number(normalizedPrice) * 100) : 0;
         const service = services.find((entry) => entry.id === item.serviceCatalogId);
+        const catalogBasePriceCents = parseDisplayPriceToCents(item.unitPrice);
+        const discountValue = parseDiscountValue(item.discountMode, item.discountValue);
+        const unitPriceCents = computeDiscountedUnitPrice(catalogBasePriceCents, item.discountMode, discountValue);
 
         return {
           ...item,
-          label: item.label || service?.name || "",
+          photoMode: undefined,
+          photoFormat: undefined,
+          label: item.label || item.serviceQuery || service?.name || "",
           serviceCatalogId: item.serviceCatalogId || undefined,
+          priceOverridden: undefined,
+          catalogBasePriceCents,
+          discountValue,
           unitPriceCents
         };
       })
-      .filter((item) => item.label.trim())
+      .filter((item) => item.label.trim() && (!item.serviceQuery || item.serviceQuery !== "Fotografie" || Boolean(item.serviceCatalogId)))
   );
   const previewTotalCents = items.reduce((sum, item) => {
-    const normalizedPrice = item.unitPrice.replace(/\./g, "").replace(",", ".");
-    const unitPriceCents = normalizedPrice ? Math.round(Number(normalizedPrice) * 100) : 0;
+    const unitPriceCents = computeDiscountedUnitPrice(
+      parseDisplayPriceToCents(item.unitPrice),
+      item.discountMode,
+      parseDiscountValue(item.discountMode, item.discountValue)
+    );
     return sum + (Number.isFinite(unitPriceCents) ? unitPriceCents : 0) * Math.max(1, item.quantity || 1);
   }, 0);
+  const filledRows = items.filter((item) => item.label.trim() || item.notes.trim()).length;
 
   return (
     <form action={action} className="stack">
-      <div className="grid grid-2">
-        <section className="card card-pad">
+      <section className="card card-pad order-sheet-hero">
+        <div className="order-sheet-head">
+          <div className="stack compact-stack">
+            <span className="compact-kicker">Scheda ordine</span>
+            <h3>Copia commissione digitale</h3>
+            <p className="card-muted">
+              Modulo rapido da banco: cliente, consegna, acconto e righe lavorazione tutte nella stessa scheda.
+            </p>
+          </div>
+          <div className="order-sheet-summary">
+            <div className="order-sheet-chip">
+              <span className="subtle">Cliente</span>
+              <strong>{selectedCustomer ? selectedCustomer.name : "Nuovo cliente"}</strong>
+            </div>
+            <div className="order-sheet-chip">
+              <span className="subtle">Righe</span>
+              <strong>{filledRows}</strong>
+            </div>
+            <div className="order-sheet-chip">
+              <span className="subtle">Totale</span>
+              <strong>{new Intl.NumberFormat("it-IT", { style: "currency", currency: "EUR" }).format(previewTotalCents / 100)}</strong>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <div className="grid grid-2 order-sheet-grid">
+        <section className="card card-pad order-sheet-panel">
           <div className="stack">
             <div>
               <h3>Cliente</h3>
-              <p className="card-muted">Seleziona un cliente esistente o creane uno nuovo nello stesso form.</p>
+              <p className="card-muted">Seleziona un cliente o inseriscilo al volo come sulla copia commissione.</p>
             </div>
             <div className="form-grid">
               <div className="field full">
@@ -84,7 +379,7 @@ export function OrderForm({
                 >
                   <option value="">Nuovo cliente</option>
                   {customers.map((customer) => (
-                  <option key={customer.id} value={customer.id}>
+                    <option key={customer.id} value={customer.id}>
                       {customer.name} - {customer.phone}
                     </option>
                   ))}
@@ -127,20 +422,24 @@ export function OrderForm({
           </div>
         </section>
 
-        <section className="card card-pad">
+        <section className="card card-pad order-sheet-panel">
           <div className="stack">
             <div>
               <h3>Dati ordine</h3>
-              <p className="card-muted">Il codice ordine verra creato come YYYY-MM-DD_titolo dell'ordine.</p>
+              <p className="card-muted">Campi essenziali per prendere in carico l’ordine senza perdere tempo.</p>
             </div>
             <div className="form-grid">
               <div className="field full">
-                <label htmlFor="title">Titolo ordine</label>
+                <label htmlFor="title">Titolo / lavoro</label>
                 <input id="title" name="title" placeholder="Biglietti visita Rossi" required />
               </div>
               <div className="field wide">
                 <label htmlFor="deliveryAt">Consegna prevista</label>
                 <input id="deliveryAt" name="deliveryAt" required type="datetime-local" />
+              </div>
+              <div className="field wide">
+                <label htmlFor="appointmentAt">Appuntamento programmato</label>
+                <input id="appointmentAt" name="appointmentAt" type="datetime-local" />
               </div>
               <div className="field">
                 <label htmlFor="priority">Priorita</label>
@@ -166,6 +465,16 @@ export function OrderForm({
                 <label htmlFor="initialDeposit">Acconto iniziale</label>
                 <input id="initialDeposit" name="initialDeposit" placeholder="0,00" />
               </div>
+              <div className="field">
+                <label className="toggle-field" htmlFor="isQuote">
+                  <input id="isQuote" name="isQuote" type="checkbox" />
+                  <span>Preventivo</span>
+                </label>
+              </div>
+              <div className="field full">
+                <label htmlFor="appointmentNote">Nota appuntamento</label>
+                <input id="appointmentNote" name="appointmentNote" placeholder="Installazione vetrina, sopralluogo, lavorazione esterna" />
+              </div>
               <div className="field full">
                 <label htmlFor="notes">Note operative</label>
                 <textarea id="notes" name="notes" />
@@ -175,11 +484,11 @@ export function OrderForm({
         </section>
       </div>
 
-      <section className="card card-pad">
+      <section className="card card-pad order-sheet-lines">
         <div className="list-header">
           <div>
-            <h3>Righe ordine</h3>
-            <p className="card-muted">Catalogo e lavorazioni personalizzate nello stesso ordine.</p>
+            <h3>Righe lavorazione</h3>
+            <p className="card-muted">Impostate come una copia commissione: numero riga, articolo, quantita, prezzo e note rapide.</p>
           </div>
           <button
             className="ghost"
@@ -194,168 +503,336 @@ export function OrderForm({
         </div>
         <input name="itemsPayload" type="hidden" value={itemsPayload} />
 
-        <div className="stack">
-          {items.map((item, index) => (
-            <article className="mini-item" key={index}>
-              <div className="list-header">
-                <strong>Riga {index + 1}</strong>
-                {items.length > 1 ? (
-                  <button
-                    className="ghost"
-                    onClick={(event) => {
-                      event.preventDefault();
-                      setItems((current) => current.filter((_, itemIndex) => itemIndex !== index));
-                    }}
-                    type="button"
-                  >
-                    Rimuovi
-                  </button>
-                ) : null}
-              </div>
-              <div className="form-grid">
-                <div className="field wide">
-                  <label htmlFor={`service-${index}`}>Servizio catalogo</label>
-                  <select
-                    id={`service-${index}`}
-                    onChange={(event) => {
-                      const service = services.find((entry) => entry.id === event.target.value);
-                      setItems((current) =>
-                        current.map((entry, itemIndex) =>
-                          itemIndex === index
-                            ? {
-                                ...entry,
-                                serviceCatalogId: event.target.value,
-                                label: entry.label || service?.name || entry.label,
-                                unitPrice:
-                                  entry.unitPrice ||
-                                  (service ? (service.basePriceCents / 100).toFixed(2).replace(".", ",") : "")
+        <div className="order-lines-stack">
+          {items.map((item, index) => {
+            const selectedService = services.find((entry) => entry.id === item.serviceCatalogId);
+            const suggestions = getServiceSuggestions(item.serviceQuery);
+            const parsedTiers = getServiceTiers(selectedService);
+            const selectedPhotographyOption = photographyFormats.find((entry) => entry.serviceId === item.serviceCatalogId && entry.label === item.photoFormat);
+            const isPhotographyRow = item.photoMode || item.serviceQuery === "Fotografie" || Boolean(selectedPhotographyOption);
+            const showSuggestions =
+              activeServiceField === index &&
+              item.serviceQuery.trim().length > 0 &&
+              (!selectedService || normalizeCatalogSearch(item.serviceQuery) !== normalizeCatalogSearch(selectedService.name) || isPhotographyRow);
+            const hasTierEntries = parsedTiers.length > 0;
+            const lineFinalCents = computeDiscountedUnitPrice(
+              parseDisplayPriceToCents(item.unitPrice),
+              item.discountMode,
+              parseDiscountValue(item.discountMode, item.discountValue)
+            );
+
+            return (
+              <article className="order-line-card" key={index}>
+                <div className="order-line-head">
+                  <div className="order-line-index">#{index + 1}</div>
+                  <strong>Voce lavorazione</strong>
+                  <span className="pill">{new Intl.NumberFormat("it-IT", { style: "currency", currency: "EUR" }).format(lineFinalCents / 100)}</span>
+                  {items.length > 1 ? (
+                    <button
+                      className="ghost"
+                      onClick={(event) => {
+                        event.preventDefault();
+                        setItems((current) => current.filter((_, itemIndex) => itemIndex !== index));
+                      }}
+                      type="button"
+                    >
+                      Rimuovi
+                    </button>
+                  ) : null}
+                </div>
+                <div className="form-grid order-line-grid">
+                  <div className={`field wide order-line-service${isPhotographyRow ? " order-line-service-photo" : ""}`}>
+                    <label htmlFor={`service-${index}`}>Articolo / servizio</label>
+                    <input
+                      autoComplete="off"
+                      id={`service-${index}`}
+                      onChange={(event) => {
+                        const nextValue = event.target.value;
+                        const normalizedNextValue = normalizeCatalogSearch(nextValue);
+                        const matchesSelectedService =
+                          selectedService && normalizedNextValue === normalizeCatalogSearch(selectedService.name);
+
+                        setItems((current) =>
+                          current.map((entry, itemIndex) =>
+                            itemIndex === index
+                                ? {
+                                    ...entry,
+                                    serviceQuery: nextValue,
+                                    photoMode: matchesSelectedService ? entry.photoMode : false,
+                                    photoFormat: matchesSelectedService ? entry.photoFormat : "",
+                                    label: nextValue,
+                                    serviceCatalogId: matchesSelectedService ? entry.serviceCatalogId : "",
+                                    unitPrice: matchesSelectedService ? entry.unitPrice : entry.priceOverridden ? entry.unitPrice : "",
+                                    priceOverridden: matchesSelectedService ? entry.priceOverridden : entry.priceOverridden,
+                                    format: matchesSelectedService ? entry.format : ""
+                                }
+                              : entry
+                          )
+                        );
+                        setActiveServiceField(index);
+                        if (!event.target.value.trim()) {
+                          setOpenTierIndex((current) => (current === index ? null : current));
+                        }
+                      }}
+                      onBlur={() => {
+                        window.setTimeout(() => {
+                          setActiveServiceField((current) => (current === index ? null : current));
+                        }, 120);
+                      }}
+                      onFocus={() => setActiveServiceField(index)}
+                      placeholder="Scrivi per cercare nel catalogo o inserire una voce libera"
+                      value={item.serviceQuery}
+                    />
+                    <div className="order-line-service-tools">
+                      {hasTierEntries ? <span className="pill order-line-tier-badge">Prezzo a scaglioni</span> : null}
+                      <button
+                        className="ghost order-line-tier-toggle"
+                        disabled={!hasTierEntries}
+                        onClick={(event) => {
+                          event.preventDefault();
+                          if (!hasTierEntries) {
+                            return;
+                          }
+
+                          setOpenTierIndex((current) => (current === index ? null : index));
+                        }}
+                        type="button"
+                      >
+                        Scaglioni
+                      </button>
+                    </div>
+                    {showSuggestions ? (
+                      <div className="order-line-suggestions">
+                        {suggestions.map((suggestion) => (
+                          <button
+                            className="order-line-suggestion"
+                            key={suggestion.key}
+                            onClick={(event) => {
+                              event.preventDefault();
+                              if (suggestion.type === "photography") {
+                                selectPhotographyForRow(index);
+                                return;
                               }
-                            : entry
+
+                              selectServiceForRow(index, suggestion.service);
+                            }}
+                            onMouseDown={(event) => event.preventDefault()}
+                            type="button"
+                          >
+                            <strong>{suggestion.label}</strong>
+                            <span>{suggestion.meta}</span>
+                          </button>
+                        ))}
+                      </div>
+                    ) : null}
+                    {hasTierEntries && openTierIndex === index ? (
+                      <div className="order-line-tier-panel">
+                        {parsedTiers.map((tier) => (
+                          <button
+                            className={`order-line-tier-chip${isTierSelected(tier, item.quantity) && !item.priceOverridden ? " is-selected" : ""}`}
+                            key={`${index}-${tier.minQuantity}-${tier.maxQuantity ?? "plus"}`}
+                            onClick={(event) => {
+                              event.preventDefault();
+                              if (!selectedService) {
+                                return;
+                              }
+
+                              setItems((current) =>
+                                current.map((entry, itemIndex) =>
+                                  itemIndex === index
+                                    ? {
+                                        ...entry,
+                                        quantity: tier.minQuantity,
+                                        unitPrice: (tier.unitPriceCents / 100).toFixed(2).replace(".", ","),
+                                        priceOverridden: false
+                                      }
+                                    : entry
+                                )
+                              );
+                            }}
+                            type="button"
+                          >
+                            <strong>{formatTierLabel(tier)}</strong>
+                            <span>{(tier.unitPriceCents / 100).toFixed(2).replace(".", ",")} €</span>
+                          </button>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                  {isPhotographyRow ? (
+                    <div className="field order-line-photo-format">
+                      <label htmlFor={`photo-format-${index}`}>Taglio foto</label>
+                      <select
+                        id={`photo-format-${index}`}
+                        onChange={(event) => {
+                          const nextOption = photographyFormats.find((entry) => entry.key === event.target.value);
+
+                          setItems((current) =>
+                            current.map((entry, itemIndex) => {
+                              if (itemIndex !== index) {
+                                return entry;
+                              }
+
+                              if (!nextOption) {
+                                return {
+                                  ...entry,
+                                  photoMode: true,
+                                  photoFormat: "",
+                                  serviceCatalogId: "",
+                                  unitPrice: "",
+                                  format: "",
+                                  priceOverridden: false
+                                };
+                              }
+
+                              return {
+                                ...entry,
+                                serviceQuery: "Fotografie",
+                                photoMode: true,
+                                photoFormat: nextOption.label,
+                                label: "Fotografie",
+                                serviceCatalogId: nextOption.serviceId,
+                                format: nextOption.label,
+                                unitPrice: getCatalogPriceDisplay(nextOption.service, entry.quantity),
+                                discountMode: "NONE",
+                                discountValue: "",
+                                priceOverridden: false
+                              };
+                            })
+                          );
+                        }}
+                        value={selectedPhotographyOption?.key || ""}
+                      >
+                        <option value="">Seleziona formato</option>
+                        {photographyFormats.map((option) => (
+                          <option key={option.key} value={option.key}>
+                            {option.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  ) : null}
+                  <div className="field order-line-qty">
+                    <label htmlFor={`quantity-${index}`}>Qta</label>
+                    <input
+                      id={`quantity-${index}`}
+                      min={1}
+                      onChange={(event) => {
+                        const nextQuantity = Number.parseInt(event.target.value || "1", 10) || 1;
+
+                        setItems((current) =>
+                          current.map((entry, itemIndex) => {
+                            if (itemIndex !== index) {
+                              return entry;
+                            }
+
+                            const service = services.find((serviceEntry) => serviceEntry.id === entry.serviceCatalogId);
+
+                            if (!service || entry.priceOverridden) {
+                              return { ...entry, quantity: nextQuantity };
+                            }
+
+                            return {
+                              ...entry,
+                              quantity: nextQuantity,
+                              unitPrice: getCatalogPriceDisplay(service, nextQuantity)
+                            };
+                          })
+                        );
+                      }}
+                      type="number"
+                      value={item.quantity}
+                    />
+                  </div>
+                  <div className="field order-line-price">
+                    <label htmlFor={`unitPrice-${index}`}>Prezzo listino</label>
+                    <input
+                      id={`unitPrice-${index}`}
+                      onChange={(event) =>
+                        setItems((current) =>
+                          current.map((entry, itemIndex) =>
+                            itemIndex === index ? { ...entry, unitPrice: event.target.value, priceOverridden: true } : entry
+                          )
                         )
-                      );
-                    }}
-                    value={item.serviceCatalogId}
-                  >
-                    <option value="">Lavorazione personalizzata</option>
-                    {services.map((service) => (
-                      <option key={service.id} value={service.id}>
-                        {service.name}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div className="field wide">
-                  <label htmlFor={`label-${index}`}>Etichetta</label>
-                  <input
-                    id={`label-${index}`}
-                    onChange={(event) =>
-                      setItems((current) =>
-                        current.map((entry, itemIndex) =>
-                          itemIndex === index ? { ...entry, label: event.target.value } : entry
+                      }
+                      placeholder="0,00"
+                      value={item.unitPrice}
+                    />
+                  </div>
+                  <div className="field order-line-discount-mode">
+                    <label htmlFor={`discountMode-${index}`}>Sconto</label>
+                    <select
+                      id={`discountMode-${index}`}
+                      onChange={(event) =>
+                        setItems((current) =>
+                          current.map((entry, itemIndex) =>
+                            itemIndex === index
+                              ? {
+                                  ...entry,
+                                  discountMode: event.target.value as DiscountModeValue,
+                                  discountValue: event.target.value === "NONE" ? "" : entry.discountValue
+                                }
+                              : entry
+                          )
                         )
-                      )
-                    }
-                    value={item.label}
-                  />
-                </div>
-                <div className="field">
-                  <label htmlFor={`quantity-${index}`}>Quantita</label>
-                  <input
-                    id={`quantity-${index}`}
-                    min={1}
-                    onChange={(event) =>
-                      setItems((current) =>
-                        current.map((entry, itemIndex) =>
-                          itemIndex === index
-                            ? { ...entry, quantity: Number.parseInt(event.target.value || "1", 10) || 1 }
-                            : entry
+                      }
+                      value={item.discountMode}
+                    >
+                      {Object.entries(discountModeLabels).map(([value, label]) => (
+                        <option key={value} value={value}>
+                          {label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="field order-line-discount-value">
+                    <label htmlFor={`discountValue-${index}`}>Valore sconto</label>
+                    <input
+                      disabled={item.discountMode === "NONE"}
+                      id={`discountValue-${index}`}
+                      onChange={(event) =>
+                        setItems((current) =>
+                          current.map((entry, itemIndex) =>
+                            itemIndex === index ? { ...entry, discountValue: event.target.value } : entry
+                          )
                         )
-                      )
-                    }
-                    type="number"
-                    value={item.quantity}
-                  />
-                </div>
-                <div className="field">
-                  <label htmlFor={`unitPrice-${index}`}>Prezzo unitario</label>
-                  <input
-                    id={`unitPrice-${index}`}
-                    onChange={(event) =>
-                      setItems((current) =>
-                        current.map((entry, itemIndex) =>
-                          itemIndex === index ? { ...entry, unitPrice: event.target.value } : entry
+                      }
+                      placeholder={item.discountMode === "PERCENT" ? "10" : "0,00"}
+                      value={item.discountValue}
+                    />
+                  </div>
+                  <div className="field order-line-final">
+                    <label htmlFor={`finalPrice-${index}`}>Prezzo finale</label>
+                    <input
+                      disabled
+                      id={`finalPrice-${index}`}
+                      value={new Intl.NumberFormat("it-IT", { style: "currency", currency: "EUR" }).format(lineFinalCents / 100)}
+                    />
+                  </div>
+                  <div className="field full order-line-notes">
+                    <label htmlFor={`notes-${index}`}>Note riga</label>
+                    <textarea
+                      id={`notes-${index}`}
+                      onChange={(event) =>
+                        setItems((current) =>
+                          current.map((entry, itemIndex) =>
+                            itemIndex === index ? { ...entry, notes: event.target.value } : entry
+                          )
                         )
-                      )
-                    }
-                    placeholder="0,00"
-                    value={item.unitPrice}
-                  />
+                      }
+                      value={item.notes}
+                    />
+                  </div>
                 </div>
-                <div className="field">
-                  <label htmlFor={`format-${index}`}>Formato</label>
-                  <input
-                    id={`format-${index}`}
-                    onChange={(event) =>
-                      setItems((current) =>
-                        current.map((entry, itemIndex) =>
-                          itemIndex === index ? { ...entry, format: event.target.value } : entry
-                        )
-                      )
-                    }
-                    value={item.format}
-                  />
-                </div>
-                <div className="field">
-                  <label htmlFor={`material-${index}`}>Materiale</label>
-                  <input
-                    id={`material-${index}`}
-                    onChange={(event) =>
-                      setItems((current) =>
-                        current.map((entry, itemIndex) =>
-                          itemIndex === index ? { ...entry, material: event.target.value } : entry
-                        )
-                      )
-                    }
-                    value={item.material}
-                  />
-                </div>
-                <div className="field">
-                  <label htmlFor={`finishing-${index}`}>Finitura</label>
-                  <input
-                    id={`finishing-${index}`}
-                    onChange={(event) =>
-                      setItems((current) =>
-                        current.map((entry, itemIndex) =>
-                          itemIndex === index ? { ...entry, finishing: event.target.value } : entry
-                        )
-                      )
-                    }
-                    value={item.finishing}
-                  />
-                </div>
-                <div className="field full">
-                  <label htmlFor={`description-${index}`}>Descrizione / note riga</label>
-                  <textarea
-                    id={`description-${index}`}
-                    onChange={(event) =>
-                      setItems((current) =>
-                        current.map((entry, itemIndex) =>
-                          itemIndex === index
-                            ? { ...entry, description: event.target.value, notes: event.target.value }
-                            : entry
-                        )
-                      )
-                    }
-                    value={item.description}
-                  />
-                </div>
-              </div>
-            </article>
-          ))}
+              </article>
+          );
+          })}
         </div>
-        <div className="list-header">
-          <span className="card-muted">Totale anteprima</span>
-          <strong>{new Intl.NumberFormat("it-IT", { style: "currency", currency: "EUR" }).format(previewTotalCents / 100)}</strong>
+        <div className="order-sheet-footer">
+          <div className="order-sheet-chip">
+            <span className="card-muted">Totale anteprima</span>
+            <strong>{new Intl.NumberFormat("it-IT", { style: "currency", currency: "EUR" }).format(previewTotalCents / 100)}</strong>
+          </div>
         </div>
       </section>
 
